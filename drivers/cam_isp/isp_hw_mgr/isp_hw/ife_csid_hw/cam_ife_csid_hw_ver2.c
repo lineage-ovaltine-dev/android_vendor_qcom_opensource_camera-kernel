@@ -26,13 +26,6 @@
 #include "cam_cdm_util.h"
 #include "cam_common_util.h"
 #include "cam_subdev.h"
-#ifdef OPLUS_FEATURE_CAMERA_COMMON
-#include <linux/sched.h>
-#include <linux/signal.h>
-#include <linux/workqueue.h>
-#include <linux/jiffies.h>
-#include <linux/atomic.h>
-#endif
 
 /* CSIPHY TPG VC/DT values */
 #define CAM_IFE_CPHY_TPG_VC_VAL                         0x0
@@ -59,19 +52,6 @@
 
 /* Max number of sof irq's triggered in case of SOF freeze */
 #define CAM_CSID_IRQ_SOF_DEBUG_CNT_MAX 12
-
-#ifdef OPLUS_FEATURE_CAMERA_COMMON
-#define CAM_CPHY_ERROR_TIMEOUT_MS                      4000
-#define CAM_CPHY_CHECK_DURATION_MS                     3000
-#define CAM_CPHY_CLEAR_COUNT_DURATION_MS               (CAM_CPHY_ERROR_TIMEOUT_MS + CAM_CPHY_CHECK_DURATION_MS)
-
-extern pid_t camera_provider_pid;
-extern bool enable_cphy_crash;
-static bool cphy_crashed = false;
-atomic64_t cphy_first_time = ATOMIC64_INIT(0);
-static void cam_cphy_clear_work_cb(struct work_struct *work);
-DECLARE_DELAYED_WORK(cam_cphy_clr_cnt_work, cam_cphy_clear_work_cb);
-#endif
 
 static void cam_ife_csid_ver2_print_debug_reg_status(
 	struct cam_ife_csid_ver2_hw *csid_hw,
@@ -931,58 +911,6 @@ static inline uint32_t cam_ife_csid_ver2_input_core_to_hw_idx(int core_sel)
 	}
 }
 
-#ifdef OPLUS_FEATURE_CAMERA_COMMON
-static void cam_cphy_clear_work_cb(struct work_struct *work)
-{
-	atomic64_set(&cphy_first_time, 0);
-}
-
-static void cam_clear_cphy_count(u64 delay_ms)
-{
-	if (delay_ms == 0) {
-		atomic64_set(&cphy_first_time, 0);
-		if (delayed_work_pending(&cam_cphy_clr_cnt_work)) {
-			cancel_delayed_work(&cam_cphy_clr_cnt_work);
-		}
-	} else {
-		if (!delayed_work_pending(&cam_cphy_clr_cnt_work)) {
-			queue_delayed_work(system_wq, &cam_cphy_clr_cnt_work, msecs_to_jiffies(delay_ms));
-		}
-	}
-}
-
-static void cam_handle_cphy_error()
-{
-	if (enable_cphy_crash) {
-		if (!cphy_crashed) {
-			struct task_struct *provider_task = find_task_by_vpid(camera_provider_pid);
-
-			if (provider_task) {
-				CAM_ERR(CAM_ISP, "CPHY issus. Kill provider.");
-				send_sig(SIGKILL, provider_task, 0);
-			}
-			cphy_crashed = true;
-		} else {
-			u64 first_time = atomic64_read(&cphy_first_time);
-			u64 now = get_jiffies_64();
-
-			if (first_time == 0) {
-				atomic64_set(&cphy_first_time, now);
-				cam_clear_cphy_count(CAM_CPHY_CLEAR_COUNT_DURATION_MS);
-			} else if (time_after64(now, first_time + msecs_to_jiffies(CAM_CPHY_ERROR_TIMEOUT_MS))) {
-				struct task_struct *provider_task = find_task_by_vpid(camera_provider_pid);
-
-				if (provider_task) {
-					CAM_ERR(CAM_ISP, "CPHY issus timeout. Kill provider.");
-					send_sig(SIGKILL, provider_task, 0);
-				}
-				cam_clear_cphy_count(0);
-			}
-		}
-	}
-}
-#endif
-
 static int cam_ife_csid_ver2_handle_event_err(
 	struct cam_ife_csid_ver2_hw  *csid_hw,
 	uint32_t                      irq_status,
@@ -1029,15 +957,6 @@ static int cam_ife_csid_ver2_handle_event_err(
 
 	csid_hw->event_cb(csid_hw->token, CAM_ISP_HW_EVENT_ERROR, (void *)&evt);
 
-#ifdef OPLUS_FEATURE_CAMERA_COMMON
-	/**
-	 * for CPHY issue.
-	 */
-	if (err_type & (CAM_ISP_HW_ERROR_RECOVERY_OVERFLOW | CAM_ISP_HW_ERROR_CSID_FRAME_SIZE)) {
-		cam_handle_cphy_error();
-	}
-#endif
-
 	return 0;
 }
 
@@ -1059,9 +978,6 @@ static int cam_ife_csid_ver2_rx_err_bottom_half(
 	uint32_t                                    long_pkt_ftr_val;
 	uint32_t                                    total_crc;
 	uint32_t                                    data_idx;
-#ifdef OPLUS_FEATURE_CAMERA_COMMON
-	bool                                        cphy_error = false;
-#endif
 	if (!handler_priv || !evt_payload_priv) {
 		CAM_ERR(CAM_ISP, "Invalid params");
 		return -EINVAL;
@@ -1112,18 +1028,12 @@ static int cam_ife_csid_ver2_rx_err_bottom_half(
 			CAM_ERR_BUF(CAM_ISP, log_buf, CAM_IFE_CSID_LOG_BUF_LEN, &len,
 				"INPUT_FIFO_OVERFLOW [Lanes:%s]: Skew/Less Data on lanes/ Slow csid clock:%luHz",
 				tmp_buf, soc_info->applied_src_clk_rate);
-#ifdef OPLUS_FEATURE_CAMERA_COMMON
-			cphy_error = true;
-#endif
 		}
 
 		if (irq_status & IFE_CSID_VER2_RX_ERROR_CPHY_PH_CRC) {
 			event_type |= CAM_ISP_HW_ERROR_CSID_PKT_HDR_CORRUPTED;
 			CAM_ERR_BUF(CAM_ISP, log_buf, CAM_IFE_CSID_LOG_BUF_LEN, &len,
 				"CPHY_PH_CRC: Pkt Hdr CRC mismatch");
-#ifdef OPLUS_FEATURE_CAMERA_COMMON
-			cphy_error = true;
-#endif
 		}
 
 		if (irq_status & IFE_CSID_VER2_RX_STREAM_UNDERFLOW) {
@@ -1134,9 +1044,6 @@ static int cam_ife_csid_ver2_rx_err_bottom_half(
 			CAM_ERR_BUF(CAM_ISP, log_buf, CAM_IFE_CSID_LOG_BUF_LEN, &len,
 				"STREAM_UNDERFLOW: Fewer bytes rcvd than WC:%d in pkt hdr",
 				val & 0xFFFF);
-#ifdef OPLUS_FEATURE_CAMERA_COMMON
-			cphy_error = true;
-#endif
 		}
 
 		if (irq_status & IFE_CSID_VER2_RX_ERROR_ECC) {
@@ -1179,18 +1086,12 @@ static int cam_ife_csid_ver2_rx_err_bottom_half(
 					total_crc, long_pkt_ftr_val & 0xffff,
 					long_pkt_ftr_val >> 16, val >> 22,
 					(val >> 16) & 0x3F, val & 0xFFFF);
-#ifdef OPLUS_FEATURE_CAMERA_COMMON
-				cphy_error = true;
-#endif
 			} else {
 				CAM_ERR_BUF(CAM_ISP, log_buf,
 					CAM_IFE_CSID_LOG_BUF_LEN, &len,
 					"PHY_CRC_ERROR: Long pkt payload CRC mismatch. Totl CRC Errs: %u, Rcvd CRC: 0x%x Caltd CRC: 0x%x",
 					total_crc, long_pkt_ftr_val & 0xffff,
 					long_pkt_ftr_val >> 16);
-#ifdef OPLUS_FEATURE_CAMERA_COMMON
-				cphy_error = true;
-#endif
 			}
 		}
 
@@ -1246,14 +1147,6 @@ static int cam_ife_csid_ver2_rx_err_bottom_half(
 			rx_irq_status, event_type, false, NULL);
 		csid_hw->flags.reset_awaited = true;
 	}
-#ifdef OPLUS_FEATURE_CAMERA_COMMON
-	/**
-	 * for CPHY issue.
-	 */
-	if (cphy_error) {
-		cam_handle_cphy_error();
-	}
-#endif
 unlock:
 	spin_unlock(&csid_hw->lock_state);
 end:
